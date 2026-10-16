@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import secrets
+import asyncio
 from typing import Optional
 
 import httpx
@@ -25,6 +26,12 @@ KIRI_VOICE = os.getenv("KIRI_VOICE", "Maly").strip() or "Maly"
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 FERNET_KEY = os.getenv("FERNET_KEY", "").strip()
+
+# Speech-to-text (SRT) via somlengsrt.com  (optional; needs API Starter/Pro plan)
+SRT_API = "https://somlengsrt.com/api/v1"
+SOMLENG_SRT_TOKEN = os.getenv("SOMLENG_SRT_TOKEN", "").strip()
+SRT_LANGS = {"km-KH", "en-US", "ja-JP", "zh-CN"}
+SRT_MAX_BYTES = 20 * 1024 * 1024  # Telegram getFile limit for bots
 
 def required_env():
     missing = []
@@ -162,27 +169,145 @@ async def create_speech(text: str) -> bytes:
         raise RuntimeError("Kiritts returned an empty audio file")
     return response.content
 
+
+def _find_key(obj, keys):
+    """Search nested JSON for the first matching key (robust to response shape)."""
+    if isinstance(obj, dict):
+        for k in keys:
+            if k in obj and obj[k] not in (None, ""):
+                return obj[k]
+        for v in obj.values():
+            found = _find_key(v, keys)
+            if found not in (None, ""):
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_key(v, keys)
+            if found not in (None, ""):
+                return found
+    return None
+
+async def download_telegram_file(token: str, file_id: str) -> bytes:
+    info = await tg_call(token, "getFile", json_body={"file_id": file_id})
+    file_path = info.get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram file path missing")
+    async with httpx.AsyncClient(timeout=50) as client:
+        response = await client.get(f"{TELEGRAM_API}/file/bot{token}/{file_path}")
+    if response.status_code >= 400:
+        raise RuntimeError("Could not download audio from Telegram")
+    return response.content
+
+async def transcribe_to_srt(audio: bytes, filename: str, language: str) -> bytes:
+    if not SOMLENG_SRT_TOKEN:
+        raise RuntimeError("SOMLENG_SRT_TOKEN is not configured")
+    headers = {"Authorization": f"Bearer {SOMLENG_SRT_TOKEN}"}
+    async with httpx.AsyncClient(timeout=50) as client:
+        up = await client.post(
+            f"{SRT_API}/transcribe",
+            headers=headers,
+            files={"audio": (filename, audio)},
+            data={"language": language},
+        )
+        if up.status_code in (401, 402, 403):
+            raise RuntimeError("SRT API token invalid or subscription required")
+        if up.status_code >= 400:
+            raise RuntimeError(f"SRT upload failed ({up.status_code})")
+        file_id = _find_key(up.json(), ["id", "file_id", "fileId"])
+        if not file_id:
+            raise RuntimeError("SRT API did not return a file id")
+
+        # Poll status (Vercel function limit: stay under ~50s total)
+        for _ in range(22):
+            await asyncio.sleep(2)
+            st = await client.get(f"{SRT_API}/files/{file_id}/status", headers=headers)
+            if st.status_code >= 400:
+                raise RuntimeError(f"SRT status failed ({st.status_code})")
+            status = str(_find_key(st.json(), ["status"]) or "").lower()
+            if status == "completed":
+                break
+            if status == "failed":
+                raise RuntimeError("SRT transcription failed")
+        else:
+            raise RuntimeError("TIMEOUT")
+
+        srt = await client.get(f"{SRT_API}/files/{file_id}/srt", headers=headers)
+        if srt.status_code >= 400 or not srt.content:
+            raise RuntimeError("Could not download SRT file")
+        return srt.content
+
+def extract_audio_ref(message: dict):
+    """Return (file_id, filename, size) for voice/audio/video-note/audio documents."""
+    for key, default_name in (("voice", "voice.ogg"), ("audio", "audio.mp3"), ("video_note", "video.mp4"), ("video", "video.mp4")):
+        media = message.get(key)
+        if media and media.get("file_id"):
+            return media["file_id"], media.get("file_name") or default_name, media.get("file_size") or 0
+    doc = message.get("document")
+    if doc and doc.get("file_id") and str(doc.get("mime_type", "")).startswith(("audio/", "video/")):
+        return doc["file_id"], doc.get("file_name") or "audio.mp3", doc.get("file_size") or 0
+    return None
+
+async def process_srt_message(token: str, message: dict, ref) -> None:
+    chat_id = (message.get("chat") or {}).get("id")
+    file_id, filename, size = ref
+    caption = (message.get("caption") or "").strip()
+    language = caption if caption in SRT_LANGS else "km-KH"
+
+    if not SOMLENG_SRT_TOKEN:
+        await send_text(token, chat_id, "មុខងារបម្លែងសំឡេងទៅជា SRT មិនទាន់បើកទេ។")
+        return
+    if size and size > SRT_MAX_BYTES:
+        await send_text(token, chat_id, "ឯកសារធំពេក។ សូមផ្ញើតិចជាង 20MB។")
+        return
+
+    await send_text(token, chat_id, f"កំពុងបម្លែងសំឡេងទៅជា SRT ({language}) សូមរង់ចាំ...")
+    try:
+        audio = await download_telegram_file(token, file_id)
+        srt = await transcribe_to_srt(audio, filename, language)
+        await tg_call(
+            token,
+            "sendDocument",
+            data={"chat_id": str(chat_id)},
+            files={"document": ("subtitle.srt", srt, "application/x-subrip")},
+        )
+    except Exception as exc:
+        if str(exc) == "TIMEOUT":
+            msg = "ការបម្លែងយូរពេក។ សូមសាកម្ដងទៀតជាមួយ audio ខ្លីជាងនេះ។"
+        elif "subscription" in str(exc).lower():
+            msg = "SRT API Token មិនត្រឹមត្រូវ ឬត្រូវការ Subscription។"
+        else:
+            msg = "សុំទោស! មិនអាចបង្កើត SRT បានទេ។ សូមសាកម្ដងទៀត។"
+        await send_text(token, chat_id, msg)
+
 async def process_voice_message(token: str, message: dict, *, is_manager: bool = False):
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     text = (message.get("text") or "").strip()
+
+    if not is_manager and chat_id:
+        ref = extract_audio_ref(message)
+        if ref:
+            await process_srt_message(token, message, ref)
+            return
+
     if not chat_id or not text:
         return
 
     if text.startswith("/start") or text.startswith("/help"):
         if is_manager:
             reply = (
-                "សួស្តី! នេះជា Bot Manager សម្រាប់ភ្ជាប់ Bot របស់អ្នក។\\n\\n"
+                "សួស្តី! នេះជា Bot Manager សម្រាប់ភ្ជាប់ Bot របស់អ្នក។\n\n"
                 "របៀបប្រើ៖ ផ្ញើ Bot Token ដែលបានបង្កើតតាម @BotFather មកទីនេះ។ "
-                "ប្រព័ន្ធនឹងផ្ទៀងផ្ទាត់ ហើយកំណត់ Webhook ដោយស្វ័យប្រវត្តិ។\\n\\n"
+                "ប្រព័ន្ធនឹងផ្ទៀងផ្ទាត់ ហើយកំណត់ Webhook ដោយស្វ័យប្រវត្តិ។\n\n"
                 "សុវត្ថិភាព៖ Token ជាពាក្យសម្ងាត់។ ផ្ញើវាតែក្នុង Private Chat នេះ ហើយកុំចែករំលែកវាជាសាធារណៈ។ "
                 "បន្ទាប់ពីភ្ជាប់បាន អ្នកអាចប្រើ Bot ផ្ទាល់ខ្លួនរបស់អ្នកដើម្បីបម្លែងអត្ថបទទៅជាសំឡេង AI។"
             )
         else:
             reply = (
-                "សួស្តី! ផ្ញើអត្ថបទដែលអ្នកចង់បម្លែងទៅជាសំឡេង AI មកខ្ញុំ។\\n"
-                "ឧទាហរណ៍៖ /voice Maly (សម្រាប់កំណត់សំឡេង មុខងារនេះអាស្រ័យលើការកំណត់របស់ម្ចាស់ប្រព័ន្ធ)\\n"
-                "ផ្ញើអត្ថបទធម្មតាដើម្បីបង្កើតឯកសារសំឡេង MP3។"
+                "សួស្តី! ផ្ញើអត្ថបទដែលអ្នកចង់បម្លែងទៅជាសំឡេង AI មកខ្ញុំ។\n"
+                "ឧទាហរណ៍៖ /voice Maly (សម្រាប់កំណត់សំឡេង មុខងារនេះអាស្រ័យលើការកំណត់របស់ម្ចាស់ប្រព័ន្ធ)\n"
+                "ផ្ញើអត្ថបទធម្មតាដើម្បីបង្កើតឯកសារសំឡេង MP3។\n"
+                "ផ្ញើ Voice/Audio ដើម្បីបម្លែងទៅជា SRT (Caption: km-KH, en-US, ja-JP, zh-CN)។"
             )
         await send_text(token, chat_id, reply)
         return
@@ -331,8 +456,8 @@ async def handle_manager_message(manager_token: str, message: dict):
         )
         await send_text(
             manager_token, chat_id,
-            f"ភ្ជាប់បានជោគជ័យ! 🎉\\nBot: @{bot_info.get('username', 'unknown')}\\n"
-            "ឥឡូវនេះ សាកផ្ញើអត្ថបទទៅ Bot របស់អ្នក ដើម្បីបង្កើតសំឡេង AI។\\n"
+            f"ភ្ជាប់បានជោគជ័យ! 🎉\nBot: @{bot_info.get('username', 'unknown')}\n"
+            "ឥឡូវនេះ សាកផ្ញើអត្ថបទទៅ Bot របស់អ្នក ដើម្បីបង្កើតសំឡេង AI។\n"
             "កុំចែករំលែក Token របស់អ្នក។ ប្រសិនបើ Token លេចធ្លាយ សូមបង្កើត Token ថ្មីតាម @BotFather។"
         )
     except Exception:
