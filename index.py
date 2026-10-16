@@ -10,47 +10,24 @@ from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Telegram AI Voice Bot Platform")
+app = FastAPI(title="Telegram SRT Bot Platform")
 
 TELEGRAM_API = "https://api.telegram.org"
-KIRI_API = "https://api.kiritts.com/v1/audio/speech"
 
 MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN", "").strip()
 MANAGER_BOT_TOKEN = os.getenv("MANAGER_BOT_TOKEN", "").strip()
-KIRI_API_KEY = os.getenv("KIRI_API_KEY", "").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
 SETUP_SECRET = os.getenv("SETUP_SECRET", "").strip()
 MAIN_WEBHOOK_SECRET = os.getenv("MAIN_WEBHOOK_SECRET", "").strip()
 MANAGER_WEBHOOK_SECRET = os.getenv("MANAGER_WEBHOOK_SECRET", "").strip()
-KIRI_VOICE = os.getenv("KIRI_VOICE", "Maly").strip() or "Maly"
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 FERNET_KEY = os.getenv("FERNET_KEY", "").strip()
 
-# Speech-to-text (SRT) via somlengsrt.com  (optional; needs API Starter/Pro plan)
 SRT_API = "https://somlengsrt.com/api/v1"
 SOMLENG_SRT_TOKEN = os.getenv("SOMLENG_SRT_TOKEN", "").strip()
 SRT_LANGS = {"km-KH", "en-US", "ja-JP", "zh-CN"}
-SRT_MAX_BYTES = 20 * 1024 * 1024  # Telegram getFile limit for bots
-
-def required_env():
-    missing = []
-    for name, value in [
-        ("MAIN_BOT_TOKEN", MAIN_BOT_TOKEN),
-        ("MANAGER_BOT_TOKEN", MANAGER_BOT_TOKEN),
-        ("KIRI_API_KEY", KIRI_API_KEY),
-        ("APP_BASE_URL", APP_BASE_URL),
-        ("SETUP_SECRET", SETUP_SECRET),
-        ("MAIN_WEBHOOK_SECRET", MAIN_WEBHOOK_SECRET),
-        ("MANAGER_WEBHOOK_SECRET", MANAGER_WEBHOOK_SECRET),
-        ("SUPABASE_URL", SUPABASE_URL),
-        ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY),
-        ("FERNET_KEY", FERNET_KEY),
-    ]:
-        if not value:
-            missing.append(name)
-    if missing:
-        raise RuntimeError("Missing environment variables: " + ", ".join(missing))
+SRT_MAX_BYTES = 20 * 1024 * 1024
 
 def fernet():
     if not FERNET_KEY:
@@ -92,7 +69,6 @@ async def send_text(token: str, chat_id: int, text: str):
     try:
         await tg_call(token, "sendMessage", json_body={"chat_id": chat_id, "text": text})
     except Exception:
-        # Do not log tokens or full API response data.
         pass
 
 async def db_request(method: str, path: str, *, params=None, body=None, prefer=None):
@@ -138,40 +114,7 @@ async def save_connected_bot(record: dict):
         prefer="resolution=merge-duplicates,return=minimal",
     )
 
-async def create_speech(text: str) -> bytes:
-    if not KIRI_API_KEY:
-        raise RuntimeError("KIRI_API_KEY is not configured")
-    payload = {
-        "model": "kiritts",
-        "input": text[:4000],
-        "voice": KIRI_VOICE,
-        "response_format": "mp3",
-    }
-    async with httpx.AsyncClient(timeout=55) as client:
-        response = await client.post(
-            KIRI_API,
-            headers={
-                "Authorization": f"Bearer {KIRI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-    if response.status_code >= 400:
-        # Avoid returning the API key or raw sensitive headers.
-        detail = "Kiritts API request failed."
-        try:
-            body = response.json()
-            detail = str(body.get("detail", detail))[:250]
-        except ValueError:
-            pass
-        raise RuntimeError(detail)
-    if not response.content:
-        raise RuntimeError("Kiritts returned an empty audio file")
-    return response.content
-
-
 def _find_key(obj, keys):
-    """Search nested JSON for the first matching key (robust to response shape)."""
     if isinstance(obj, dict):
         for k in keys:
             if k in obj and obj[k] not in (None, ""):
@@ -217,7 +160,6 @@ async def transcribe_to_srt(audio: bytes, filename: str, language: str) -> bytes
         if not file_id:
             raise RuntimeError("SRT API did not return a file id")
 
-        # Poll status (Vercel function limit: stay under ~50s total)
         for _ in range(22):
             await asyncio.sleep(2)
             st = await client.get(f"{SRT_API}/files/{file_id}/status", headers=headers)
@@ -237,7 +179,6 @@ async def transcribe_to_srt(audio: bytes, filename: str, language: str) -> bytes
         return srt.content
 
 def extract_audio_ref(message: dict):
-    """Return (file_id, filename, size) for voice/audio/video-note/audio documents."""
     for key, default_name in (("voice", "voice.ogg"), ("audio", "audio.mp3"), ("video_note", "video.mp4"), ("video", "video.mp4")):
         media = message.get(key)
         if media and media.get("file_id"):
@@ -300,47 +241,23 @@ async def process_voice_message(token: str, message: dict, *, is_manager: bool =
                 "របៀបប្រើ៖ ផ្ញើ Bot Token ដែលបានបង្កើតតាម @BotFather មកទីនេះ។ "
                 "ប្រព័ន្ធនឹងផ្ទៀងផ្ទាត់ ហើយកំណត់ Webhook ដោយស្វ័យប្រវត្តិ។\n\n"
                 "សុវត្ថិភាព៖ Token ជាពាក្យសម្ងាត់។ ផ្ញើវាតែក្នុង Private Chat នេះ ហើយកុំចែករំលែកវាជាសាធារណៈ។ "
-                "បន្ទាប់ពីភ្ជាប់បាន អ្នកអាចប្រើ Bot ផ្ទាល់ខ្លួនរបស់អ្នកដើម្បីបម្លែងអត្ថបទទៅជាសំឡេង AI។"
+                "បន្ទាប់ពីភ្ជាប់បាន អ្នកអាចប្រើ Bot ផ្ទាល់ខ្លួនរបស់អ្នកដើម្បីបម្លែងសំឡេងទៅជា SRT។"
             )
         else:
             reply = (
-                "សួស្តី! ផ្ញើអត្ថបទដែលអ្នកចង់បម្លែងទៅជាសំឡេង AI មកខ្ញុំ។\n"
-                "ឧទាហរណ៍៖ /voice Maly (សម្រាប់កំណត់សំឡេង មុខងារនេះអាស្រ័យលើការកំណត់របស់ម្ចាស់ប្រព័ន្ធ)\n"
-                "ផ្ញើអត្ថបទធម្មតាដើម្បីបង្កើតឯកសារសំឡេង MP3។\n"
-                "ផ្ញើ Voice/Audio ដើម្បីបម្លែងទៅជា SRT (Caption: km-KH, en-US, ja-JP, zh-CN)។"
+                "សួស្តី! ផ្ញើ Voice, Audio ឬ Video មកខ្ញុំ ដើម្បីបម្លែងទៅជាឯកសារ SRT។\n"
+                "ភាសា៖ km-KH (លំនាំដើម), en-US, ja-JP, zh-CN។ សរសេរភាសាក្នុង Caption នៃឯកសារ ដើម្បីប្តូរ។"
             )
         await send_text(token, chat_id, reply)
         return
 
-    if text.startswith("/voice"):
-        await send_text(token, chat_id, "សូមផ្ញើអត្ថបទដែលអ្នកចង់បម្លែងទៅជាសំឡេង AI។")
-        return
-
-    if text.startswith("/"):
-        await send_text(token, chat_id, "សូមផ្ញើអត្ថបទធម្មតា ដើម្បីបង្កើតសំឡេង AI។")
-        return
-
-    if len(text) > 4000:
-        await send_text(token, chat_id, "អត្ថបទវែងពេក។ សូមកាត់ឱ្យតិចជាង 4,000 តួអក្សរ។")
-        return
-
-    await send_text(token, chat_id, "កំពុងបង្កើតសំឡេង AI សូមរង់ចាំបន្តិច...")
-    try:
-        audio = await create_speech(text)
-        await tg_call(
-            token,
-            "sendAudio",
-            data={"chat_id": str(chat_id), "title": "AI Voice", "performer": "AI Voice Bot"},
-            files={"audio": ("ai-voice.mp3", audio, "audio/mpeg")},
-        )
-    except Exception:
-        await send_text(token, chat_id, "សុំទោស! មិនអាចបង្កើតសំឡេងបានទេ។ សូមពិនិត្យ API Key ឬសាកម្ដងទៀត។")
+    await send_text(token, chat_id, "សូមផ្ញើ Voice, Audio ឬ Video មក ដើម្បីបម្លែងទៅជា SRT។")
 
 @app.get("/")
 async def home():
     return {
         "ok": True,
-        "service": "Telegram AI Voice Bot Platform",
+        "service": "Telegram SRT Bot Platform",
         "routes": ["/health", "/setup-webhooks", "/webhook/main", "/webhook/manager", "/webhook/{bot_key}"],
     }
 
@@ -407,7 +324,6 @@ async def handle_manager_message(manager_token: str, message: dict):
     if not chat_id or not user_id or not text:
         return
 
-    # Only accept token submissions in private chats to avoid public token exposure.
     if chat.get("type") != "private":
         await send_text(manager_token, chat_id, "សូមប្រើ Bot Manager ក្នុង Private Chat ប៉ុណ្ណោះ។")
         return
@@ -421,14 +337,12 @@ async def handle_manager_message(manager_token: str, message: dict):
         return
 
     candidate = text.split()[0]
-    # Validate token with Telegram before storing it.
     try:
         bot_info = await tg_call(candidate, "getMe")
     except Exception:
         await send_text(manager_token, chat_id, "Token មិនត្រឹមត្រូវ ឬ Telegram មិនអាចផ្ទៀងផ្ទាត់បានទេ។ សូមពិនិត្យម្ដងទៀត។")
         return
 
-    # Prevent replacing a bot already connected by a different account.
     bot_key = bot_key_for(candidate)
     try:
         existing = await find_connected_bot(bot_key)
@@ -457,16 +371,14 @@ async def handle_manager_message(manager_token: str, message: dict):
         await send_text(
             manager_token, chat_id,
             f"ភ្ជាប់បានជោគជ័យ! 🎉\nBot: @{bot_info.get('username', 'unknown')}\n"
-            "ឥឡូវនេះ សាកផ្ញើអត្ថបទទៅ Bot របស់អ្នក ដើម្បីបង្កើតសំឡេង AI។\n"
+            "ឥឡូវនេះ សាកផ្ញើ Voice ទៅ Bot របស់អ្នក ដើម្បីបង្កើត SRT។\n"
             "កុំចែករំលែក Token របស់អ្នក។ ប្រសិនបើ Token លេចធ្លាយ សូមបង្កើត Token ថ្មីតាម @BotFather។"
         )
     except Exception:
-        # Do not log the submitted token.
         await send_text(manager_token, chat_id, "ភ្ជាប់មិនបានទេ។ សូមពិនិត្យការកំណត់ Database, Encryption Key និង Webhook របស់ Vercel។")
 
 @app.post("/webhook/{bot_key}")
 async def user_bot_webhook(bot_key: str, request: Request):
-    # Reserved route names are handled by the fixed routes above.
     if bot_key in {"main", "manager"}:
         raise HTTPException(status_code=404, detail="Not found")
     update = await request.json()
@@ -484,5 +396,4 @@ async def user_bot_webhook(bot_key: str, request: Request):
     except HTTPException:
         raise
     except Exception:
-        # Do not expose credentials or internal exception details.
         raise HTTPException(status_code=500, detail="Webhook processing failed")
